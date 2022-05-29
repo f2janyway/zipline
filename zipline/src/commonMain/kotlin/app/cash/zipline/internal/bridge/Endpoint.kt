@@ -17,11 +17,12 @@ package app.cash.zipline.internal.bridge
 
 import app.cash.zipline.EventListener
 import app.cash.zipline.ZiplineService
+import app.cash.zipline.internal.decodeFromStringFast
+import app.cash.zipline.internal.encodeToStringFast
 import kotlin.coroutines.Continuation
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
-import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.modules.SerializersModule
 
@@ -35,7 +36,7 @@ class Endpoint internal constructor(
   internal val eventListener: EventListener,
   internal val outboundChannel: CallChannel,
 ) {
-  private val inboundServices = mutableMapOf<String, InboundService<*>>()
+  internal val inboundServices = mutableMapOf<String, InboundService<*>>()
   private var nextId = 1
 
   internal val incompleteContinuations = mutableSetOf<Continuation<*>>()
@@ -45,6 +46,8 @@ class Endpoint internal constructor(
 
   val clientNames: Set<String>
     get() = outboundChannel.serviceNamesArray().toSet()
+
+  private val internalCallSerializer = InternalCallSerializer(this)
 
   /** This uses both Zipline-provided serializers and user-provided serializers. */
   internal val json: Json = Json {
@@ -62,13 +65,13 @@ class Endpoint internal constructor(
     }
 
     override fun call(encodedArguments: Array<String>): Array<String> {
-      val call = InboundCall(encodedArguments)
-      val service = takeService(call.serviceName, call.funName)
-      call.context = service.context
+      val call = json.decodeFromStringFast(internalCallSerializer, encodedArguments.single()) as InboundCall2
+
+      val service = call.service ?: error("no handler for ${call.serviceName}")
 
       return when {
-        call.callbackName.isNotEmpty() -> service.callSuspending(call)
-        else -> service.call(call)
+        call.callbackName != null -> service.callSuspending(call)
+        else -> arrayOf(service.call(call))
       }
     }
 
@@ -151,41 +154,33 @@ class Endpoint internal constructor(
   internal inner class InboundService<T : ZiplineService>(
     val service: T,
     val context: InboundBridge.Context,
-    val handlers: Map<String, ZiplineFunction<T>>,
+    val functions: Map<String, ZiplineFunction<T>>,
   ) {
-    fun call(call: InboundCall): Array<String> {
+    fun call(call: InboundCall2): String {
       return try {
-        val handler = handlers[call.funName]
-        if (handler == null) {
-          call.unexpectedFunction(handlers.keys.toList())
-        } else {
-          val decodedArgs = handler.argSerializers.map { call.parameter(it) }
-          val response = handler.call(service, decodedArgs)
-          call.result(handler.resultSerializer as KSerializer<Any?>, response)
-        }
+        val function = call.function ?: unexpectedFunction(call.functionName, functions.keys)
+        val args = call.args ?: error("no args")
+        val result = (function as ZiplineFunction<ZiplineService>).call(service, args)
+        context.json.encodeToStringFast(function.callResultSerializer as CallResultSerializer<Any?>, Result.success(result))
       } catch (e: Throwable) {
-        call.resultException(e)
+        context.json.encodeToStringFast(failureResultSerializer, Result.failure(e))
       }
     }
 
-    fun callSuspending(call: InboundCall): Array<String> {
-      val suspendCallbackName = call.callbackName
+    fun callSuspending(call: InboundCall2): Array<String> {
+      val suspendCallbackName = call.callbackName!!
       val job = scope.launch {
-        val result = try {
-          val handler = handlers[call.funName]
-          if (handler == null) {
-            call.unexpectedFunction(handlers.keys.toList())
-          } else {
-            val decodedArgs = handler.argSerializers.map { call.parameter(it) }
-            val response = handler.callSuspending(service, decodedArgs)
-            call.result(handler.resultSerializer as KSerializer<Any?>, response)
-          }
-        } catch (e: Exception) {
-          call.resultException(e)
+        val encodedResult = try {
+          val function = call.function ?: unexpectedFunction(call.functionName, functions.keys)
+          val args = call.args ?: error("no args")
+          val result = (function as ZiplineFunction<ZiplineService>).callSuspending(service, args)
+          context.json.encodeToStringFast(function.callResultSerializer as CallResultSerializer<Any?>, Result.success(result))
+        } catch (e: Throwable) {
+          context.json.encodeToStringFast(failureResultSerializer, Result.failure(e))
         }
         scope.ensureActive() // Don't resume a continuation if the Zipline has since been closed.
         val suspendCallback = take<SuspendCallback>(suspendCallbackName)
-        suspendCallback.call(result)
+        suspendCallback.call(encodedResult)
       }
 
       val cancelCallbackName = cancelCallbackName(suspendCallbackName)

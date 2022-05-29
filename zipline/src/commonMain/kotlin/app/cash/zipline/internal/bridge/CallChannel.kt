@@ -66,13 +66,6 @@ internal interface CallChannel {
   fun disconnect(instanceName: String): Boolean
 }
 
-internal const val LABEL_VALUE = "v"
-internal const val LABEL_NULL = "n"
-internal const val LABEL_EXCEPTION = "t"
-internal const val LABEL_SERVICE_NAME = "s"
-internal const val LABEL_FUN_NAME = "f"
-internal const val LABEL_CALLBACK_NAME = "c"
-
 internal object ThrowableSerializer : KSerializer<Throwable> {
   override val descriptor = PrimitiveSerialDescriptor("ZiplineThrowable", PrimitiveKind.STRING)
 
